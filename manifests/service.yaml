@@ -1,0 +1,22 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: journalgather
+  namespace: vsphere-infra-helpers
+  labels:
+    app: journalgather
+spec:
+  externalTrafficPolicy: Cluster
+  ipFamilies:
+    - IPv4
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  internalTrafficPolicy: Cluster
+  allocateLoadBalancerNodePorts: true
+  type: LoadBalancer
+  ipFamilyPolicy: SingleStack
+  sessionAffinity: None
+  selector:
+    app: journalgather

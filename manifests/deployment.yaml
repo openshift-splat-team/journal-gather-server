@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: journalgather
+  namespace: vsphere-infra-helpers
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: journalgather
+  template:
+    metadata:
+      labels:
+        app: journalgather
+    spec:
+      containers:
+      - name: journalgather-container
+        image: your-registry/your-image:your-tag # Replace with your actual container image
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: log-storage
+          mountPath: /logs
+      volumes:
+      - name: log-storage
+        persistentVolumeClaim:
+          claimName: log-storage
