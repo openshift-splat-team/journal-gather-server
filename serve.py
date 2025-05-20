@@ -1,44 +1,31 @@
+import socket
 import os
-from flask import Flask, request, abort, send_file
-from werkzeug.utils import secure_filename
+from flask import Flask, request, abort, send_file, jsonify
+import threading
 
+UPLOAD_DIR = '/tmp/logs'
 app = Flask(__name__)
 
-# Directory to store uploaded files.  Make sure this directory exists.
-UPLOAD_DIR = 'uploads'
-if not os.path.exists(UPLOAD_DIR):
-    os.makedirs(UPLOAD_DIR)
+def handle_client(client_socket, client_address):
+    """Handles the connection with a single client and appends to the file."""
+    try:
+        client_ip = client_address[0]
+        filename = f"{client_ip}.txt"
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        print(f"Connection from {client_address}. Appending data to {file_path}")
 
-@app.route('/upload', methods=['POST'])
-def handle_post():
-    """
-    Handles HTTP POST requests to the '/upload' URL.
-    It saves the uploaded file to the server's filesystem,
-    naming the file with the client's IP address.
-
-    Returns:
-        tuple: A tuple containing a success message and a 200 OK status code,
-               or an error message and a 400 Bad Request status code.
-    """
-    if 'file' not in request.files:
-        abort(400, 'No file provided')
-
-    file = request.files['file']
-    if file.filename == '':
-        abort(400, 'Empty filename')
-
-    if file:
-        # Use the client's IP address as the filename.
-        filename = request.remote_addr.replace(":", "_")  # Use _ instead of : which are invalid in filenames
-        filename = secure_filename(filename) # Sanitize the filename
-        filepath = os.path.join(UPLOAD_DIR, filename)
-        try:
-            file.save(filepath)
-            return f'File uploaded successfully to {filepath}', 200
-        except Exception as e:
-            print(f"Error saving file: {e}")
-            abort(500, f"Error saving file: {e}")  # Handle file save errors
-    abort(400, 'Invalid file') #general error
+        with open(file_path, 'ab') as file:  # Open in append binary mode ('ab')
+            while True:
+                data = client_socket.recv(1024)
+                if not data:
+                    break  # Client disconnected
+                file.write(data)
+        print(f"Data received from {client_address} and appended to {file_path}")
+    except Exception as e:
+        print(f"Error handling client {client_address}: {e}")
+    finally:
+        client_socket.close()
+        print(f"Connection with {client_address} closed.")
 
 @app.route('/retrieve', methods=['GET'])
 def retrieve_file():
@@ -55,27 +42,51 @@ def retrieve_file():
     if not node_ip:
         abort(400, 'Missing node-ip parameter')
 
-    # Sanitize the node_ip parameter in case it comes from user
-    filename = secure_filename(node_ip.replace(":", "_"))
-    filepath = os.path.join(UPLOAD_DIR, filename)
+    file_name = node_ip + ".txt"
+    file_path = os.path.join(UPLOAD_DIR, file_name)
 
-    if not os.path.exists(filepath):
+    if not os.path.exists(file_path):
         abort(404, 'File not found')
 
-    try:
-        # Use send_file to send the file.  This handles many of the details
-        # (e.g., setting the Content-Disposition header).
-        response = send_file(filepath, as_attachment=True)
-        os.remove(filepath)  # Delete the file after sending it.
+    try:        
+        response = send_file(file_path, as_attachment=True)
+        print(f"Retrieved log data for {node_ip}") 
+
+        os.remove(file_path)  # Delete the file after sending it.
         return response
     except Exception as e:
         print(f"Error sending/deleting file: {e}")
         abort(500, f"Error sending/deleting file: {e}")
 
-if __name__ == '__main__':
-    # Start the Flask development server.
-    # The debug=True option allows the server to restart automatically
-    # when you make changes to the code.  This is useful for development.
-    app.run(host='0.0.0.0', port=8080, debug=True)
-    # 0.0.0.0 makes the server accessible from outside the local machine
-    # Port 8080 is a common port for web applications.
+def run_server():
+    app.run(host='0.0.0.0', port=8080, debug=False)
+
+def main():
+    """Sets up the TCP server and listens for connections."""
+    host = '0.0.0.0'  # Listen on all available interfaces
+    port = 12345      # You can choose a different port
+
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    try:
+        server_socket.bind((host, port))
+        server_socket.listen(5)  # Allow up to 5 pending connections
+        print(f"Listening on {host}:{port}...")
+
+        while True:
+            client_socket, client_address = server_socket.accept()
+            client_thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
+            client_thread.start()
+
+    except KeyboardInterrupt:
+        print("Server shutting down...")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        server_socket.close()
+
+if __name__ == "__main__":    
+    server_thread = threading.Thread(target=run_server)
+    server_thread.start()
+    print("Flask server started in a new thread.")
+    main()

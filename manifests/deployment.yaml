@@ -18,6 +18,7 @@ spec:
         image: your-registry/your-image:your-tag # Replace with your actual container image
         ports:
         - containerPort: 8080
+        - containerPort: 12345
         volumeMounts:
         - name: log-storage
           mountPath: /logs
