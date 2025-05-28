@@ -1,92 +1,196 @@
-import socket
-import os
-from flask import Flask, request, abort, send_file, jsonify
-import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import os # Import the os module for path manipulation
+from socketserver import ThreadingMixIn # Import ThreadingMixIn for multithreading
 
-UPLOAD_DIR = '/tmp/logs'
-app = Flask(__name__)
+PORT = 8000
+LOG_DIR = "/logs" # Directory to store the log files
 
-def handle_client(client_socket, client_address):
-    """Handles the connection with a single client and appends to the file."""
-    try:
-        client_ip = client_address[0]
-        filename = f"{client_ip}.txt"
-        file_path = os.path.join(UPLOAD_DIR, filename)
-        print(f"Connection from {client_address}. Appending data to {file_path}")
+# Define a Threading HTTP Server to handle concurrent requests
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in a separate thread."""
+    pass
 
-        with open(file_path, 'ab') as file:  # Open in append binary mode ('ab')
-            while True:
-                data = client_socket.recv(1024)
-                if not data:
-                    break  # Client disconnected
-                file.write(data)
-        print(f"Data received from {client_address} and appended to {file_path}")
-    except Exception as e:
-        print(f"Error handling client {client_address}: {e}")
-    finally:
-        client_socket.close()
-        print(f"Connection with {client_address} closed.")
+class SimplePOSTHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        # Ensure the log directory exists
+        os.makedirs(LOG_DIR, exist_ok=True)
 
-@app.route('/retrieve', methods=['GET'])
-def retrieve_file():
-    """
-    Handles HTTP GET requests to the '/retrieve' URL.
-    It retrieves the file associated with the provided 'node-ip' parameter,
-    sends the file to the client, and deletes the file from the server.
+        # Get the 'node-id' header
+        node_ip = self.headers.get('node-id')
+        
+        # Determine the filename
+        if node_ip:
+            # Replace any characters that might be invalid in a filename (e.g., colons in IPv6, though we expect IPv4)
+            # For IPv4, this is usually fine, but good practice for robustness.
+            clean_node_ip = node_ip.replace(':', '_').replace('.', '_') # Simple cleaning, adjust if needed
+            filename = f"{clean_node_ip}.txt"
+            log_message_prefix = f"node-id '{node_ip}'"
+        else:
+            filename = "unknown_node.txt"
+            log_message_prefix = "No 'node-id' header provided"
+            print("WARNING: 'node-id' header not found. Logging to 'unknown_node.txt'.")
 
-    Returns:
-        Response: The file to be downloaded, or a 404 Not Found error if the
-                  file does not exist.
-    """
-    node_ip = request.args.get('node-ip')
-    if not node_ip:
-        abort(400, 'Missing node-ip parameter')
+        file_path = os.path.join(LOG_DIR, filename)
 
-    file_name = node_ip + ".txt"
-    file_path = os.path.join(UPLOAD_DIR, file_name)
+        content_length = int(self.headers['Content-Length'])
+        post_body_bytes = self.rfile.read(content_length)
+        
+        # Decode the body for printing and writing
+        try:
+            post_body_str = post_body_bytes.decode('utf-8')
+            # Attempt to pretty-print JSON for console output if applicable
+            if 'application/json' in self.headers.get('Content-Type', ''):
+                try:
+                    console_output = json.dumps(json.loads(post_body_str), indent=2)
+                except json.JSONDecodeError:
+                    console_output = post_body_str # Fallback if JSON decoding fails
+            else:
+                console_output = post_body_str
+        except UnicodeDecodeError:
+            console_output = f"[Undecodable binary data, {len(post_body_bytes)} bytes]"
+            post_body_str = console_output # Use this for file writing too if it's truly undecodable
 
-    if not os.path.exists(file_path):
-        abort(404, 'File not found')
+        print(f"Received POST request body ({len(post_body_bytes)} bytes):")
+        print(console_output)
 
-    try:        
-        response = send_file(file_path, as_attachment=True)
-        print(f"Retrieved log data for {node_ip}") 
+        # Write the body to the file
+        try:
+            # Open in append mode ('a') and ensure UTF-8 encoding
+            with open(file_path, 'a', encoding='utf-8') as f:
+                f.write(post_body_str)
+                f.write("\n") # Add a couple of newlines to separate entries
+            print(f"Successfully appended body to '{file_path}'")
+            response_message = f"POST request received. Body appended to '{filename}'. {log_message_prefix}."
+            status_code = 200
+        except IOError as e:
+            print(f"ERROR: Could not write to file '{file_path}': {e}")
+            response_message = f"Error writing body to file: {e}"
+            status_code = 500 # Internal Server Error
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            response_message = f"An unexpected server error occurred: {e}"
+            status_code = 500
 
-        os.remove(file_path)  # Delete the file after sending it.
-        return response
-    except Exception as e:
-        print(f"Error sending/deleting file: {e}")
-        abort(500, f"Error sending/deleting file: {e}")
+        # Send response back to the client
+        self.send_response(status_code)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(response_message.encode('utf-8'))
+
+    def do_GET(self):
+        # Get the 'node-id' header
+        node_ip = self.headers.get('node-id')
+
+        if not node_ip:
+            # If node-id header is missing, return 400 Bad Request
+            self.send_response(400)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"Error: 'node-id' header is required for GET requests.\n")
+            print("GET request failed: 'node-id' header missing.")
+            return
+
+        # Determine the filename based on node-id
+        clean_node_ip = node_ip.replace(':', '_').replace('.', '_')
+        filename = f"{clean_node_ip}.txt"
+        file_path = os.path.join(LOG_DIR, filename)
+
+        try:
+            # Check if the file exists
+            if not os.path.exists(file_path):
+                self.send_response(404)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(f"Error: Log file for node-id '{node_ip}' not found.\n".encode('utf-8'))
+                print(f"GET request failed: File '{file_path}' not found.")
+                return
+
+            # Read the file content
+            with open(file_path, 'r', encoding='utf-8') as f:
+                file_content = f.read()
+
+            # Send 200 OK response with file content
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(file_content.encode('utf-8'))
+            print(f"Successfully served content of '{file_path}' for GET request.")
+
+        except IOError as e:
+            self.send_response(500)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f"Error reading file '{file_path}': {e}\n".encode('utf-8'))
+            print(f"GET request failed: Error reading file '{file_path}': {e}")
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f"An unexpected server error occurred: {e}\n".encode('utf-8'))
+            print(f"GET request failed: An unexpected error occurred: {e}")
+
+    def do_DELETE(self):
+        # Get the 'node-id' header
+        node_ip = self.headers.get('node-id')
+
+        if not node_ip:
+            # If node-id header is missing, return 400 Bad Request
+            self.send_response(400)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"Error: 'node-id' header is required for DELETE requests.\n")
+            print("DELETE request failed: 'node-id' header missing.")
+            return
+
+        # Determine the filename based on node-id
+        clean_node_ip = node_ip.replace(':', '_').replace('.', '_')
+        filename = f"{clean_node_ip}.txt"
+        file_path = os.path.join(LOG_DIR, filename)
+
+        try:
+            # Check if the file exists before attempting to delete
+            if not os.path.exists(file_path):
+                self.send_response(404)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(f"Error: Log file for node-id '{node_ip}' not found. Nothing to delete.\n".encode('utf-8'))
+                print(f"DELETE request failed: File '{file_path}' not found.")
+                return
+
+            # Delete the file
+            os.remove(file_path)
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f"Successfully deleted log file for node-id '{node_ip}'.\n".encode('utf-8'))
+            print(f"Successfully deleted file: '{file_path}'.")
+
+        except OSError as e: # More specific for file system errors
+            self.send_response(500)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f"Error deleting file '{file_path}': {e}\n".encode('utf-8'))
+            print(f"DELETE request failed: Error deleting file '{file_path}': {e}")
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f"An unexpected server error occurred: {e}\n".encode('utf-8'))
+            print(f"DELETE request failed: An unexpected error occurred: {e}")
+
 
 def run_server():
-    app.run(host='0.0.0.0', port=8080, debug=False)
-
-def main():
-    """Sets up the TCP server and listens for connections."""
-    host = '0.0.0.0'  # Listen on all available interfaces
-    port = 12345      # You can choose a different port
-
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
+    server_address = ('', PORT)
+    httpd = ThreadedHTTPServer(server_address, SimplePOSTHandler)
+    print(f"Starting HTTP server on port {PORT}...")
+    print(f"Log files will be stored in the '{LOG_DIR}' directory.")
+    print("Listening for POST, GET, and DELETE requests...")
     try:
-        server_socket.bind((host, port))
-        server_socket.listen(5)  # Allow up to 5 pending connections
-        print(f"Listening on {host}:{port}...")
-
-        while True:
-            client_socket, client_address = server_socket.accept()
-            client_thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
-            client_thread.start()
-
+        httpd.serve_forever()
     except KeyboardInterrupt:
-        print("Server shutting down...")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-    finally:
-        server_socket.close()
+        print("\nShutting down the server.")
+        httpd.shutdown()
 
-if __name__ == "__main__":    
-    server_thread = threading.Thread(target=run_server)
-    server_thread.start()
-    print("Flask server started in a new thread.")
-    main()
+if __name__ == '__main__':
+    run_server()
