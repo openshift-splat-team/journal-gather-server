@@ -2,9 +2,90 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os # Import the os module for path manipulation
 from socketserver import ThreadingMixIn # Import ThreadingMixIn for multithreading
+import logging # Import the logging module
+import datetime
+import time
 
 PORT = 8000
 LOG_DIR = "/logs" # Directory to store the log files
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler() # Also log to console
+    ]
+)
+
+def delete_stale_logs(days_old=1, dry_run=False, directory_path=LOG_DIR):
+    """
+    Scans a directory and (optionally) deletes files created more than a specified number of days ago.
+
+    Args:
+        days_old (int): The number of days (inclusive) a file must be older than to be deleted.
+                        Default is 1 day.
+        dry_run (bool): If True, the script will only report which files would be deleted
+                        without actually deleting them. Default is False.
+        directory_path (str): The path to the directory to scan.
+    """
+    # Check if the directory exists
+    if not os.path.isdir(directory_path):
+        logging.critical(f"Error: Directory '{directory_path}' does not exist.")
+        return
+
+    # Calculate the cutoff time (current time minus specified days)
+    # Using modification time as it's more reliable across OS for "oldness"
+    cutoff_timestamp = time.time() - (days_old * 24 * 60 * 60)
+    
+    logging.info(f"Scanning directory: {directory_path}")
+    action_verb = "Would delete" if dry_run else "Deleting"
+    logging.info(f"{action_verb} files older than {days_old} day(s) (based on modification time)...")
+    if dry_run:
+        logging.info("--- DRY RUN MODE: No files will actually be deleted. ---")
+
+    deleted_count = 0
+    skipped_count = 0
+
+    try:
+        # Walk through all files and subdirectories
+        for root, _, files in os.walk(directory_path):
+            for file_name in files:
+                file_path = os.path.join(root, file_name)
+                
+                try:
+                    # Get the modification time of the file
+                    # os.path.getmtime returns the time in seconds since the epoch
+                    file_mod_time = os.path.getmtime(file_path)
+
+                    if file_mod_time < cutoff_timestamp:
+                        # File is older than the cutoff
+                        if dry_run:
+                            logging.info(f"  Would delete: {file_path}")
+                            deleted_count += 1 # Count as 'would be deleted'
+                        else:
+                            os.remove(file_path)
+                            logging.info(f"  Deleted: {file_path}")
+                            deleted_count += 1
+                    else:
+                        # File is not old enough to be deleted
+                        logging.debug(f"  Skipped (too new): {file_path}") 
+                        skipped_count += 1
+
+                except OSError as e:
+                    logging.critical(f"  Error processing file {file_path}: {e}")
+                except Exception as e:
+                    logging.critical(f"  An unexpected error occurred with file {file_path}: {e}")
+
+    except Exception as e:
+        logging.critical(f"An error occurred during directory scan: {e}")
+
+    logging.info("\n--- Summary ---")
+    if dry_run:
+        logging.info(f"Total files that WOULD be deleted: {deleted_count}")
+    else:
+        logging.info(f"Total files deleted: {deleted_count}")
+    logging.info(f"Total files skipped (too new or errors): {skipped_count}")
+    logging.info("Scan complete.")
 
 # Define a Threading HTTP Server to handle concurrent requests
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -29,7 +110,7 @@ class SimplePOSTHandler(BaseHTTPRequestHandler):
         else:
             filename = "unknown_node.txt"
             log_message_prefix = "No 'node-id' header provided"
-            print("WARNING: 'node-id' header not found. Logging to 'unknown_node.txt'.")
+            logging.warning("'node-id' header not found. Logging to 'unknown_node.txt'.")
 
         file_path = os.path.join(LOG_DIR, filename)
 
@@ -51,8 +132,8 @@ class SimplePOSTHandler(BaseHTTPRequestHandler):
             console_output = f"[Undecodable binary data, {len(post_body_bytes)} bytes]"
             post_body_str = console_output # Use this for file writing too if it's truly undecodable
 
-        print(f"Received POST request body ({len(post_body_bytes)} bytes):")
-        print(console_output)
+        logging.debug(f"Received POST request body ({len(post_body_bytes)} bytes):")
+        logging.debug(console_output)
 
         # Write the body to the file
         try:
@@ -60,15 +141,15 @@ class SimplePOSTHandler(BaseHTTPRequestHandler):
             with open(file_path, 'a', encoding='utf-8') as f:
                 f.write(post_body_str)
                 f.write("\n") # Add a couple of newlines to separate entries
-            print(f"Successfully appended body to '{file_path}'")
+            logging.debug(f"Successfully appended body to '{file_path}'")
             response_message = f"POST request received. Body appended to '{filename}'. {log_message_prefix}."
             status_code = 200
         except IOError as e:
-            print(f"ERROR: Could not write to file '{file_path}': {e}")
+            logging.warning(f"ERROR: Could not write to file '{file_path}': {e}")
             response_message = f"Error writing body to file: {e}"
             status_code = 500 # Internal Server Error
         except Exception as e:
-            print(f"An unexpected error occurred: {e}")
+            logging.warning(f"An unexpected error occurred: {e}")
             response_message = f"An unexpected server error occurred: {e}"
             status_code = 500
 
@@ -88,7 +169,7 @@ class SimplePOSTHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(b"Error: 'node-id' header is required for GET requests.\n")
-            print("GET request failed: 'node-id' header missing.")
+            logging.warning("GET request failed: 'node-id' header missing.")
             return
 
         # Determine the filename based on node-id
@@ -103,7 +184,7 @@ class SimplePOSTHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-type', 'text/plain')
                 self.end_headers()
                 self.wfile.write(f"Error: Log file for node-id '{node_ip}' not found.\n".encode('utf-8'))
-                print(f"GET request failed: File '{file_path}' not found.")
+                logging.warning(f"GET request failed: File '{file_path}' not found.")
                 return
 
             # Read the file content
@@ -115,22 +196,24 @@ class SimplePOSTHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(file_content.encode('utf-8'))
-            print(f"Successfully served content of '{file_path}' for GET request.")
+            logging.info(f"Successfully served content of '{file_path}' for GET request.")
 
         except IOError as e:
             self.send_response(500)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(f"Error reading file '{file_path}': {e}\n".encode('utf-8'))
-            print(f"GET request failed: Error reading file '{file_path}': {e}")
+            logging.warning(f"GET request failed: Error reading file '{file_path}': {e}")
         except Exception as e:
             self.send_response(500)
             self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(f"An unexpected server error occurred: {e}\n".encode('utf-8'))
-            print(f"GET request failed: An unexpected error occurred: {e}")
+            self.wfile(f"An unexpected server error occurred: {e}\n".encode('utf-8'))            
+            self.end_headers()            
+            logging.warning(f"An unexpected server error occurred: {e}\n".encode('utf-8'))            
 
     def do_DELETE(self):
+        delete_stale_logs(days_old=1, dry_run=False, directory_path=LOG_DIR)
+
         # Get the 'node-id' header
         node_ip = self.headers.get('node-id')
 
@@ -140,7 +223,7 @@ class SimplePOSTHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(b"Error: 'node-id' header is required for DELETE requests.\n")
-            print("DELETE request failed: 'node-id' header missing.")
+            logging.warning("DELETE request failed: 'node-id' header missing.")
             return
 
         # Determine the filename based on node-id
@@ -155,7 +238,7 @@ class SimplePOSTHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-type', 'text/plain')
                 self.end_headers()
                 self.wfile.write(f"Error: Log file for node-id '{node_ip}' not found. Nothing to delete.\n".encode('utf-8'))
-                print(f"DELETE request failed: File '{file_path}' not found.")
+                logging.warning(f"DELETE request failed: File '{file_path}' not found.")
                 return
 
             # Delete the file
@@ -163,33 +246,32 @@ class SimplePOSTHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
-            self.wfile.write(f"Successfully deleted log file for node-id '{node_ip}'.\n".encode('utf-8'))
-            print(f"Successfully deleted file: '{file_path}'.")
+            self.wfile.logging.warning(f"Successfully deleted log file for node-id '{node_ip}'.\n".encode('utf-8'))
+            logging.info(f"Successfully deleted file: '{file_path}'.")
 
         except OSError as e: # More specific for file system errors
             self.send_response(500)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(f"Error deleting file '{file_path}': {e}\n".encode('utf-8'))
-            print(f"DELETE request failed: Error deleting file '{file_path}': {e}")
+            logging.warning(f"DELETE request failed: Error deleting file '{file_path}': {e}")
         except Exception as e:
             self.send_response(500)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(f"An unexpected server error occurred: {e}\n".encode('utf-8'))
-            print(f"DELETE request failed: An unexpected error occurred: {e}")
-
+            logging.warning(f"DELETE request failed: An unexpected error occurred: {e}")
 
 def run_server():
     server_address = ('', PORT)
     httpd = ThreadedHTTPServer(server_address, SimplePOSTHandler)
-    print(f"Starting HTTP server on port {PORT}...")
-    print(f"Log files will be stored in the '{LOG_DIR}' directory.")
-    print("Listening for POST, GET, and DELETE requests...")
+    logging.info(f"Starting HTTP server on port {PORT}...")
+    logging.info(f"Log files will be stored in the '{LOG_DIR}' directory.")
+    logging.info("Listening for POST, GET, and DELETE requests...")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down the server.")
+        logging.critical("\nShutting down the server.")
         httpd.shutdown()
 
 if __name__ == '__main__':
